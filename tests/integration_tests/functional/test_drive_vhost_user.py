@@ -341,3 +341,34 @@ def test_config_change(uvm):
 
         # Check that we can create a filesystem and mount it
         vm.ssh.check_output(mkfs_mount_cmd)
+
+
+def test_config_change_before_activation(uvm):
+    """
+    Verify that a PATCH request to a vhost-user block device before the guest
+    driver activates the device does not stop Firecracker.
+    """
+
+    orig_size = 10  # MB
+    new_size = 20  # MB
+
+    vm = uvm
+    vm.spawn(log_level="Info")
+    vm.basic_config()
+    vm.add_net_iface()
+
+    fs = drive_tools.FilesystemFile(size=orig_size)
+    vm.add_vhost_user_drive("scratch", fs.path)
+
+    # Do not wait for the guest to boot, so that the PATCH request comes
+    # before the guest driver activates the device.
+    vm.api.actions.put(action_type="InstanceStart")
+    vm.patch_drive("scratch")
+
+    # Check that the guest can use the device.
+    _check_block_size(vm.ssh, "/dev/vdb", orig_size * 1024 * 1024)
+
+    # Check that a PATCH request after activation still updates the guest.
+    vm.disks_vhost_user["scratch"].resize(new_size)
+    vm.patch_drive("scratch")
+    _check_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)

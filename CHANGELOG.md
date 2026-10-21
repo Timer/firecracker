@@ -114,6 +114,12 @@ and this project adheres to
   memory written by the virtio devices is now tracked more accurately. This will
   lead to smaller incremental snapshots when dirty tracking is enabled.
 
+- [#6323](https://github.com/firecracker-microvm/firecracker/issues/6323): Fixed
+  Firecracker panicking on a `PATCH /drives/{id}` request for a vhost-user block
+  device that the guest driver has not activated yet. Firecracker now reads the
+  new config from the backend and sends the config change notification when the
+  guest driver activates the device.
+
 ## [1.17.0]
 
 ### Added
