@@ -4,11 +4,15 @@ use event_manager::{EventOps, Events, MutEventSubscriber};
 use vmm_sys_util::epoll::EventSet;
 
 use super::VhostUserBlock;
+use super::device::ConfigUpdate;
 use crate::devices::virtio::device::VirtioDevice;
-use crate::logger::{error, warn};
+use crate::devices::virtio::vhost_user::VhostUserHandleBackend;
+use crate::logger::{IncMetric, error, warn};
 
 impl VhostUserBlock {
     const PROCESS_ACTIVATE: u32 = 0;
+    const PROCESS_CONFIG_UPDATE: u32 = 1;
+    const PROCESS_CONFIG_REPLY: u32 = 2;
 
     fn register_activate_event(&self, ops: &mut EventOps) {
         if let Err(err) = ops.add(Events::with_data(
@@ -32,6 +36,58 @@ impl VhostUserBlock {
             error!("Failed to un-register activate event: {}", err);
         }
     }
+
+    fn register_config_update_event(&self, ops: &mut EventOps) {
+        if let Err(err) = ops.add(Events::with_data(
+            &self.config_update_evt,
+            Self::PROCESS_CONFIG_UPDATE,
+            EventSet::IN,
+        )) {
+            error!("Failed to register config update event: {}", err);
+        }
+    }
+
+    fn process_config_update_event(&mut self, ops: &mut EventOps) {
+        if let Err(err) = self.config_update_evt.read() {
+            error!("Failed to consume config update event: {:?}", err);
+        }
+        self.watch_config_reply(ops);
+    }
+
+    fn process_config_reply_event(&mut self, ops: &mut EventOps) {
+        self.process_config_reply();
+        self.watch_config_reply(ops);
+    }
+
+    // Watch the backend socket only while a config request waits for its reply. At other
+    // times the device does not expect data on the socket.
+    fn watch_config_reply(&mut self, ops: &mut EventOps) {
+        let expected = self.config_reply_expected();
+        if expected == self.config_reply_watched {
+            return;
+        }
+        let events = Events::with_data_raw(
+            self.vu_handle.vu.socket_fd(),
+            Self::PROCESS_CONFIG_REPLY,
+            EventSet::IN,
+        );
+        if expected {
+            match ops.add(events) {
+                Ok(()) => self.config_reply_watched = true,
+                Err(err) => {
+                    // Without the watch, the device cannot read the reply.
+                    error!("Failed to register the vhost-user socket: {}", err);
+                    self.metrics.cfg_fails.inc();
+                    self.config_update = ConfigUpdate::Failed;
+                }
+            }
+        } else {
+            if let Err(err) = ops.remove(events) {
+                error!("Failed to un-register the vhost-user socket: {}", err);
+            }
+            self.config_reply_watched = false;
+        }
+    }
 }
 
 impl MutEventSubscriber for VhostUserBlock {
@@ -41,6 +97,13 @@ impl MutEventSubscriber for VhostUserBlock {
         let event_set = event.event_set();
         let supported_events = EventSet::IN;
 
+        // The socket can also report a hang-up or an error. The read finds the cause. The
+        // device can receive the reply before the guest driver activates it.
+        if Self::PROCESS_CONFIG_REPLY == source {
+            self.process_config_reply_event(ops);
+            return;
+        }
+
         if !supported_events.contains(event_set) {
             warn!(
                 "Received unknown event: {:?} from source: {:?}",
@@ -49,7 +112,9 @@ impl MutEventSubscriber for VhostUserBlock {
             return;
         }
 
-        if self.is_activated() {
+        if Self::PROCESS_CONFIG_UPDATE == source {
+            self.process_config_update_event(ops);
+        } else if self.is_activated() {
             if Self::PROCESS_ACTIVATE == source {
                 self.process_activate_event(ops)
             } else {
@@ -68,6 +133,7 @@ impl MutEventSubscriber for VhostUserBlock {
         //  - shortly after device creation,
         //  - on device activation (is-activated already true at this point),
         //  - on device restore from snapshot.
+        self.register_config_update_event(ops);
         if self.is_activated() {
             warn!("Vhost-user block: unexpected init event");
         } else {

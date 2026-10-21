@@ -138,7 +138,26 @@ curl --unix-socket ${socket} -i \
          }"
 ```
 
-A `PATCH` request to a vhost-user drive will make Firecracker retrieve the new
-device config from the backend and send a config change notification to the
-guest. If the guest driver has not activated the device yet, Firecracker sends
-the notification when the driver activates the device.
+A `PATCH` request to a vhost-user drive makes Firecracker send a
+`VHOST_USER_GET_CONFIG` request to the backend. Firecracker does not wait for
+the reply: the API responds when Firecracker has sent the request. When the
+reply arrives, Firecracker stores the new device config and sends a config
+change notification to the guest. If the guest driver has not activated the
+device yet, Firecracker sends the notification when the driver activates the
+device. Thus, a backend that is slow to reply does not stop the API or the other
+devices of the microVM.
+
+Because of this:
+
+- A `204 No Content` response does not tell that the guest has the new config.
+  To know when the guest has the new config, monitor the guest, for example the
+  size of the block device.
+- If a `PATCH` request arrives while Firecracker waits for a reply, Firecracker
+  sends one more request after the reply. The guest gets the config that the
+  backend reports for the last request.
+- The response does not report errors from the backend. If the backend closes
+  the connection or sends a reply that is not valid, Firecracker logs an error
+  and increments the `cfg_fails` metric of the drive
+  (`vhost_user_block_<drive_id>`). The microVM continues to run. If the error
+  makes the socket unusable, Firecracker rejects the next `PATCH` requests to
+  the drive with `400 Bad Request`.

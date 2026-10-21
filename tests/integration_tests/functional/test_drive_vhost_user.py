@@ -4,9 +4,11 @@
 
 import os
 import shutil
+import signal
 from pathlib import Path
 
 import pytest
+from tenacity import retry, stop_after_delay, wait_fixed
 
 import host_tools.drive as drive_tools
 from framework.utils_drive import partuuid_and_disk_path
@@ -69,6 +71,16 @@ def _check_block_size(ssh_connection, dev_path, size):
     _, stdout, stderr = ssh_connection.run("blockdev --getsize64 {}".format(dev_path))
     assert stderr == ""
     assert stdout.strip() == str(size)
+
+
+@retry(wait=wait_fixed(0.1), stop=stop_after_delay(10), reraise=True)
+def _wait_for_block_size(ssh_connection, dev_path, size):
+    """
+    Waits until the guest reports the size of the block device.
+    Firecracker responds to a PATCH request to a vhost-user block device
+    before the guest gets the new config.
+    """
+    _check_block_size(ssh_connection, dev_path, size)
 
 
 def _check_drives(test_microvm, assert_dict, keys_array):
@@ -337,7 +349,7 @@ def test_config_change(uvm):
         vm.patch_drive("scratch")
 
         # Check that guest reports correct new size.
-        _check_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)
+        _wait_for_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)
 
         # Check that we can create a filesystem and mount it
         vm.ssh.check_output(mkfs_mount_cmd)
@@ -371,4 +383,49 @@ def test_config_change_before_activation(uvm):
     # Check that a PATCH request after activation still updates the guest.
     vm.disks_vhost_user["scratch"].resize(new_size)
     vm.patch_drive("scratch")
-    _check_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)
+    _wait_for_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)
+
+
+def test_config_change_backend_stopped(uvm):
+    """
+    Verify that a PATCH request to a vhost-user block device does not wait for
+    the backend. Firecracker serves the API while the backend does not reply,
+    and the guest gets the new config after the backend replies.
+    """
+
+    orig_size = 10  # MB
+    new_size = 20  # MB
+
+    vm = uvm
+    vm.spawn(log_level="Info")
+    vm.basic_config()
+    vm.add_net_iface()
+
+    fs = drive_tools.FilesystemFile(size=orig_size)
+    vm.add_vhost_user_drive("scratch", fs.path)
+    vm.start()
+    _check_block_size(vm.ssh, "/dev/vdb", orig_size * 1024 * 1024)
+
+    backend = vm.disks_vhost_user["scratch"]
+    backend.resize(new_size)
+    os.kill(backend.proc.pid, signal.SIGSTOP)
+    try:
+        # The PATCH request does not wait for the reply of the backend.
+        response = vm.api.session.patch(
+            vm.api.endpoint + "/drives/scratch",
+            json={"drive_id": "scratch"},
+            timeout=5,
+        )
+        assert response.status_code == 204, response.text
+
+        # The API continues to respond.
+        response = vm.api.session.get(vm.api.endpoint + "/", timeout=5)
+        assert response.status_code == 200
+        assert response.json()["state"] == "Running"
+
+        # The guest has the old config until the backend replies.
+        _check_block_size(vm.ssh, "/dev/vdb", orig_size * 1024 * 1024)
+    finally:
+        os.kill(backend.proc.pid, signal.SIGCONT)
+
+    _wait_for_block_size(vm.ssh, "/dev/vdb", new_size * 1024 * 1024)

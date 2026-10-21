@@ -313,7 +313,9 @@ paths:
       summary: Updates the properties of a drive. Post-boot only.
       description:
         Updates the properties of the drive with the ID specified by drive_id path parameter.
-        Will fail if update is not possible.
+        Will fail if update is not possible. For a vhost-user drive, Firecracker responds when
+        it has sent the request for the new config to the backend. The guest gets the new
+        config when the backend replies.
       operationId: patchGuestDriveByID
       parameters:
         - name: drive_id

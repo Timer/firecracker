@@ -4,6 +4,7 @@
 // Portions Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::io;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -21,7 +22,9 @@ use crate::devices::virtio::generated::virtio_config::VIRTIO_F_VERSION_1;
 use crate::devices::virtio::generated::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
-use crate::devices::virtio::vhost_user::{VhostUserHandleBackend, VhostUserHandleImpl};
+use crate::devices::virtio::vhost_user::{
+    VhostUserConfigReply, VhostUserHandleBackend, VhostUserHandleImpl,
+};
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
@@ -114,6 +117,29 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
 
 pub type VhostUserBlock = VhostUserBlockImpl<Frontend>;
 
+/// State of the config update that a `PATCH /drives/{id}` request starts.
+///
+/// The device sends `VHOST_USER_GET_CONFIG` and returns. The event loop reads the reply when
+/// the socket is readable, so a slow backend does not stop the VMM thread.
+#[derive(Debug)]
+pub enum ConfigUpdate {
+    /// No request waits for a reply.
+    Idle,
+    /// A `VHOST_USER_GET_CONFIG` request waits for its reply.
+    InProgress {
+        /// The part of the reply that the device received.
+        reply: VhostUserConfigReply,
+        /// A config update was requested after the device sent this request. The device
+        /// sends one more request after the reply.
+        queued: bool,
+        /// Time when the device sent the request, in microseconds.
+        start_us: u64,
+    },
+    /// The socket is closed or failed, or the start of the next reply is not known. Config
+    /// updates are not possible.
+    Failed,
+}
+
 /// vhost-user block device.
 pub struct VhostUserBlockImpl<T: VhostUserHandleBackend> {
     // Virtio fields.
@@ -129,6 +155,12 @@ pub struct VhostUserBlockImpl<T: VhostUserHandleBackend> {
     /// The config space changed while the device was not active. The guest
     /// driver gets a config change notification when it activates the device.
     pub config_change_pending: bool,
+    /// Tells the event loop to watch the backend socket for a config reply.
+    pub config_update_evt: EventFd,
+    /// State of the config update that a `PATCH /drives/{id}` request starts.
+    pub config_update: ConfigUpdate,
+    /// The event loop watches the backend socket for a config reply.
+    pub config_reply_watched: bool,
 
     // Implementation specific fields.
     pub id: String,
@@ -155,6 +187,9 @@ impl<T: VhostUserHandleBackend> std::fmt::Debug for VhostUserBlockImpl<T> {
             .field("queue_evts", &self.queue_evts)
             .field("device_state", &self.device_state)
             .field("config_change_pending", &self.config_change_pending)
+            .field("config_update_evt", &self.config_update_evt)
+            .field("config_update", &self.config_update)
+            .field("config_reply_watched", &self.config_reply_watched)
             .field("id", &self.id)
             .field("partuuid", &self.partuuid)
             .field("cache_type", &self.cache_type)
@@ -209,6 +244,8 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
 
         let activate_evt =
             EventFd::new(libc::EFD_NONBLOCK).map_err(VhostUserBlockError::EventFd)?;
+        let config_update_evt =
+            EventFd::new(libc::EFD_NONBLOCK).map_err(VhostUserBlockError::EventFd)?;
 
         let queues = vec![Queue::new(QUEUE_SIZE)];
         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VhostUserBlockError::EventFd)?;
@@ -240,6 +277,9 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
             queue_evts,
             device_state,
             config_change_pending: false,
+            config_update_evt,
+            config_update: ConfigUpdate::Idle,
+            config_reply_watched: false,
 
             id: config.drive_id,
             partuuid: config.partuuid,
@@ -268,37 +308,130 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
         }
     }
 
+    /// Start a config update: send `VHOST_USER_GET_CONFIG` to the backend, and do not wait
+    /// for the reply. The event loop reads the reply, stores the new config, and notifies
+    /// the guest driver (see [`Self::process_config_reply`]).
+    ///
+    /// If a request waits for its reply, the device sends one more request after the reply.
     pub fn config_update(&mut self) -> Result<(), VhostUserBlockError> {
-        let start_time = get_time_us(ClockType::Monotonic);
+        if self.vu_acked_protocol_features & VhostUserProtocolFeatures::CONFIG.bits() == 0 {
+            return Err(VhostUserBlockError::ConfigNotSupported);
+        }
+        match &mut self.config_update {
+            ConfigUpdate::Idle => {}
+            ConfigUpdate::InProgress { queued, .. } => {
+                *queued = true;
+                return Ok(());
+            }
+            ConfigUpdate::Failed => return Err(VhostUserBlockError::ConfigSocketFailed),
+        }
+        // Tell the event loop to watch the socket. The VMM thread runs this function, so the
+        // event loop reads the event after the request is sent.
+        self.config_update_evt
+            .write(1)
+            .map_err(VhostUserBlockError::ConfigRequest)?;
+        self.send_config_request()
+    }
 
-        // This buffer is used for config size check in vhost crate.
-        let buffer = [0u8; BLOCK_CONFIG_SPACE_SIZE as usize];
-        let (_, new_config_space) = self
-            .vu_handle
-            .vu
-            .get_config(
-                0,
-                BLOCK_CONFIG_SPACE_SIZE,
-                VhostUserConfigFlags::WRITABLE,
-                &buffer,
-            )
-            .map_err(VhostUserBlockError::Vhost)?;
-        self.config_space = new_config_space;
+    fn send_config_request(&mut self) -> Result<(), VhostUserBlockError> {
+        let start_us = get_time_us(ClockType::Monotonic);
+        match self.vu_handle.send_get_config(
+            0,
+            BLOCK_CONFIG_SPACE_SIZE,
+            VhostUserConfigFlags::WRITABLE,
+        ) {
+            Ok(()) => {
+                self.config_update = ConfigUpdate::InProgress {
+                    reply: VhostUserConfigReply::new(0, BLOCK_CONFIG_SPACE_SIZE),
+                    queued: false,
+                    start_us,
+                };
+                Ok(())
+            }
+            Err(err) => {
+                self.metrics.cfg_fails.inc();
+                // A send that fails with `WouldBlock` sends nothing, so the socket is
+                // still usable.
+                self.config_update = if err.kind() == io::ErrorKind::WouldBlock {
+                    ConfigUpdate::Idle
+                } else {
+                    ConfigUpdate::Failed
+                };
+                Err(VhostUserBlockError::ConfigRequest(err))
+            }
+        }
+    }
 
+    /// Returns true if a config request waits for its reply.
+    pub fn config_reply_expected(&self) -> bool {
+        matches!(self.config_update, ConfigUpdate::InProgress { .. })
+    }
+
+    /// Read the reply to the config request without blocking. The event loop calls this
+    /// function when the backend socket is readable.
+    ///
+    /// When the reply is complete, store the new config and notify the guest driver. If
+    /// the device is not active, notify the driver when it activates the device. An error
+    /// is logged and counted in the `cfg_fails` metric. The microVM continues to run.
+    pub fn process_config_reply(&mut self) {
+        let fd = self.vu_handle.vu.socket_fd();
+        let ConfigUpdate::InProgress {
+            reply,
+            queued,
+            start_us,
+        } = &mut self.config_update
+        else {
+            return;
+        };
+        let (queued, start_us) = (*queued, *start_us);
+        match reply.read(fd) {
+            Ok(None) => return,
+            Ok(Some(config_space)) => {
+                self.config_update = ConfigUpdate::Idle;
+                self.config_space = config_space;
+                self.notify_config_change();
+                let delta_us = get_time_us(ClockType::Monotonic) - start_us;
+                self.metrics.config_change_time_us.store(delta_us);
+            }
+            Err(err) => {
+                error!(
+                    "vhost-user-block {}: config update failed: {}",
+                    self.id, err
+                );
+                self.metrics.cfg_fails.inc();
+                self.config_update = if err.is_fatal() {
+                    ConfigUpdate::Failed
+                } else {
+                    ConfigUpdate::Idle
+                };
+            }
+        }
+        if queued
+            && matches!(self.config_update, ConfigUpdate::Idle)
+            && let Err(err) = self.send_config_request()
+        {
+            error!(
+                "vhost-user-block {}: config update failed: {}",
+                self.id, err
+            );
+        }
+    }
+
+    fn notify_config_change(&mut self) {
         match self.device_state.active_state() {
-            Some(state) => state
-                .interrupt
-                .trigger(VirtioInterruptType::Config)
-                .map_err(VhostUserBlockError::Interrupt)?,
+            Some(state) => {
+                if let Err(err) = state.interrupt.trigger(VirtioInterruptType::Config) {
+                    error!(
+                        "vhost-user-block {}: cannot send the config change interrupt: {}",
+                        self.id, err
+                    );
+                    self.metrics.cfg_fails.inc();
+                }
+            }
             // The guest driver can read the config space before it activates the
             // device, so it can have the old config. Notify it at activation.
             None => self.config_change_pending = true,
         }
-
-        let delta_us = get_time_us(ClockType::Monotonic) - start_time;
-        self.metrics.config_change_time_us.store(delta_us);
-
-        Ok(())
     }
 }
 
@@ -414,10 +547,13 @@ where
 mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, RawFd};
     use std::os::unix::net::UnixStream;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
-    use event_manager::{EventOps, Events, MutEventSubscriber};
+    use event_manager::{EventManager, EventOps, Events, MutEventSubscriber, SubscriberOps};
     use vhost::{VhostUserMemoryRegionInfo, VringConfigData};
     use vmm_sys_util::tempfile::TempFile;
 
@@ -425,7 +561,9 @@ mod tests {
     use crate::devices::virtio::block::virtio::device::FileEngineType;
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
     use crate::devices::virtio::transport::mmio::{IrqTrigger, VIRTIO_MMIO_INT_CONFIG};
-    use crate::devices::virtio::vhost_user::tests::create_mem;
+    use crate::devices::virtio::vhost_user::tests::{
+        create_mem, get_config_reply, get_config_request_len, header,
+    };
     use crate::test_utils::create_tmp_socket;
     use crate::vstate::memory::GuestAddress;
 
@@ -717,19 +855,6 @@ mod tests {
         // Writing to the config does nothing
         vhost_block.write_config(0x69, &[0]);
         assert_eq!(vhost_block.config_space, vec![0x69, 0x69, 0x69]);
-
-        // Testing [`config_update`]
-        vhost_block.device_state = DeviceState::Activated(ActiveState {
-            mem: default_mem(),
-            interrupt: default_interrupt(),
-        });
-        vhost_block.config_space = vec![];
-        vhost_block.config_update().unwrap();
-        assert_eq!(vhost_block.config_space, vec![0x69, 0x69, 0x69]);
-        assert_eq!(
-            vhost_block.interrupt_status().load(Ordering::SeqCst),
-            VIRTIO_MMIO_INT_CONFIG
-        );
     }
 
     #[test]
@@ -873,123 +998,224 @@ mod tests {
         assert!(!interrupt.has_pending_interrupt(VirtioInterruptType::Config));
     }
 
+    /// A frontend for the config update tests. It has a socket to the backend and accepts
+    /// the messages of the device activation.
+    struct ConfigFrontend {
+        sock: UnixStream,
+    }
+
+    impl VhostUserHandleBackend for ConfigFrontend {
+        fn socket_fd(&self) -> RawFd {
+            self.sock.as_raw_fd()
+        }
+
+        fn set_features(&self, _features: u64) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_mem_table(
+            &self,
+            _regions: &[VhostUserMemoryRegionInfo],
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_num(&self, _queue_index: usize, _num: u16) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_addr(
+            &self,
+            _queue_index: usize,
+            _config_data: &VringConfigData,
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_base(&self, _queue_index: usize, _base: u16) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_call(&self, _queue_index: usize, _fd: &EventFd) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_kick(&self, _queue_index: usize, _fd: &EventFd) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+
+        fn set_vring_enable(
+            &mut self,
+            _queue_index: usize,
+            _enable: bool,
+        ) -> Result<(), vhost::Error> {
+            Ok(())
+        }
+    }
+
+    impl MutEventSubscriber for VhostUserBlockImpl<ConfigFrontend> {
+        fn process(&mut self, _: Events, _: &mut EventOps) {}
+        fn init(&mut self, _: &mut EventOps) {}
+    }
+
+    const CONFIG_SIZE: usize = BLOCK_CONFIG_SPACE_SIZE as usize;
+
+    /// Make a device that is not active, has the CONFIG protocol feature, and uses `vu` to
+    /// talk to the backend.
+    fn config_test_device<T: VhostUserHandleBackend>(id: &str, vu: T) -> VhostUserBlockImpl<T> {
+        VhostUserBlockImpl {
+            avail_features: 0,
+            acked_features: 0,
+            config_space: vec![0; CONFIG_SIZE],
+            activate_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            queues: vec![Queue::new(QUEUE_SIZE)],
+            queue_evts: std::array::from_fn(|_| EventFd::new(libc::EFD_NONBLOCK).unwrap()),
+            device_state: DeviceState::Inactive,
+            config_change_pending: false,
+            config_update_evt: EventFd::new(libc::EFD_NONBLOCK).unwrap(),
+            config_update: ConfigUpdate::Idle,
+            config_reply_watched: false,
+            id: id.to_string(),
+            partuuid: None,
+            cache_type: CacheType::Unsafe,
+            root_device: false,
+            read_only: false,
+            vu_handle: VhostUserHandleImpl {
+                vu,
+                socket_path: String::new(),
+            },
+            vu_acked_protocol_features: VhostUserProtocolFeatures::CONFIG.bits(),
+            metrics: VhostUserMetricsPerDevice::alloc(format!("block_{id}")),
+        }
+    }
+
+    fn config_frontend_device(id: &str) -> (VhostUserBlockImpl<ConfigFrontend>, UnixStream) {
+        let (sock, backend) = UnixStream::pair().unwrap();
+        (config_test_device(id, ConfigFrontend { sock }), backend)
+    }
+
+    /// Make the device active with a new interrupt.
+    fn activate_with_irq<T: VhostUserHandleBackend>(
+        vhost_block: &mut VhostUserBlockImpl<T>,
+    ) -> Arc<IrqTrigger> {
+        let interrupt = Arc::new(IrqTrigger::new());
+        vhost_block.device_state = DeviceState::Activated(ActiveState {
+            mem: default_mem(),
+            interrupt: interrupt.clone(),
+        });
+        interrupt
+    }
+
+    /// Read one `VHOST_USER_GET_CONFIG` request on the backend side of the socket.
+    fn read_request(backend: &mut UnixStream) {
+        let mut request = vec![0u8; get_config_request_len(CONFIG_SIZE)];
+        backend.read_exact(&mut request).unwrap();
+        assert_eq!(
+            request[..4],
+            u32::from(FrontendReq::GET_CONFIG).to_ne_bytes()
+        );
+    }
+
+    /// Check that the backend has no more requests to read.
+    fn assert_no_request(backend: &UnixStream) {
+        backend.set_nonblocking(true).unwrap();
+        let err = (&*backend).read(&mut [0u8; 1]).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        backend.set_nonblocking(false).unwrap();
+    }
+
+    /// Check that the interrupt was sent exactly once, as a config interrupt, and clear it.
+    fn assert_config_interrupt(interrupt: &IrqTrigger) {
+        assert_eq!(interrupt.irq_evt.read().unwrap(), 1);
+        assert_eq!(
+            interrupt.irq_status.swap(0, Ordering::SeqCst),
+            VIRTIO_MMIO_INT_CONFIG
+        );
+    }
+
+    fn assert_no_interrupt(interrupt: &IrqTrigger) {
+        assert_eq!(
+            interrupt.irq_evt.read().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn test_config_update_does_not_wait() {
+        let (mut vhost_block, mut backend) = config_frontend_device("config_update_does_not_wait");
+        let interrupt = activate_with_irq(&mut vhost_block);
+
+        // The update returns before the backend replies.
+        vhost_block.config_update().unwrap();
+        assert!(vhost_block.config_reply_expected());
+        assert_eq!(vhost_block.config_update_evt.read().unwrap(), 1);
+        read_request(&mut backend);
+        vhost_block.process_config_reply();
+        assert!(vhost_block.config_reply_expected());
+        assert_eq!(vhost_block.config_space, vec![0; CONFIG_SIZE]);
+        assert_no_interrupt(&interrupt);
+
+        // The reply can arrive in parts.
+        let reply = get_config_reply(&[0x11; CONFIG_SIZE]);
+        backend.write_all(&reply[..5]).unwrap();
+        vhost_block.process_config_reply();
+        backend.write_all(&reply[5..30]).unwrap();
+        vhost_block.process_config_reply();
+        assert!(vhost_block.config_reply_expected());
+        assert_eq!(vhost_block.config_space, vec![0; CONFIG_SIZE]);
+        assert_no_interrupt(&interrupt);
+
+        // The complete reply updates the config and notifies the guest driver.
+        backend.write_all(&reply[30..]).unwrap();
+        vhost_block.process_config_reply();
+        assert!(!vhost_block.config_reply_expected());
+        assert_eq!(vhost_block.config_space, vec![0x11; CONFIG_SIZE]);
+        assert_config_interrupt(&interrupt);
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 0);
+        assert_no_request(&backend);
+
+        // A call with no request in progress does nothing.
+        vhost_block.process_config_reply();
+        assert!(!vhost_block.config_reply_expected());
+    }
+
+    #[test]
+    fn test_config_update_coalesces_requests() {
+        let (mut vhost_block, mut backend) = config_frontend_device("config_update_coalesces");
+        let interrupt = activate_with_irq(&mut vhost_block);
+
+        // Updates that come while a request waits for its reply send no request now.
+        vhost_block.config_update().unwrap();
+        vhost_block.config_update().unwrap();
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        assert_no_request(&backend);
+
+        // After the reply, the device sends one more request.
+        backend
+            .write_all(&get_config_reply(&[0x21; CONFIG_SIZE]))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.config_space, vec![0x21; CONFIG_SIZE]);
+        assert_config_interrupt(&interrupt);
+        assert!(vhost_block.config_reply_expected());
+        read_request(&mut backend);
+        assert_no_request(&backend);
+
+        backend
+            .write_all(&get_config_reply(&[0x22; CONFIG_SIZE]))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.config_space, vec![0x22; CONFIG_SIZE]);
+        assert_config_interrupt(&interrupt);
+        assert!(!vhost_block.config_reply_expected());
+        assert_no_request(&backend);
+    }
+
     #[test]
     fn test_config_update_before_activation() {
-        struct MockMaster {
-            config: VhostUserConfigPayload,
-        }
-
-        impl VhostUserHandleBackend for MockMaster {
-            fn from_stream(_sock: UnixStream, _max_queue_num: u64) -> Self {
-                Self { config: vec![0x1] }
-            }
-
-            fn set_owner(&self) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_hdr_flags(&self, _flags: VhostUserHeaderFlag) {}
-
-            fn get_features(&self) -> Result<u64, vhost::Error> {
-                Ok(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
-            }
-
-            fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, vhost::Error> {
-                Ok(VhostUserProtocolFeatures::CONFIG)
-            }
-
-            fn set_protocol_features(
-                &mut self,
-                _features: VhostUserProtocolFeatures,
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn get_config(
-                &mut self,
-                _offset: u32,
-                _size: u32,
-                _flags: VhostUserConfigFlags,
-                _buf: &[u8],
-            ) -> Result<(VhostUserConfig, VhostUserConfigPayload), vhost::Error> {
-                Ok((VhostUserConfig::default(), self.config.clone()))
-            }
-
-            fn set_features(&self, _features: u64) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_mem_table(
-                &self,
-                _regions: &[VhostUserMemoryRegionInfo],
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_num(&self, _queue_index: usize, _num: u16) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_addr(
-                &self,
-                _queue_index: usize,
-                _config_data: &VringConfigData,
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_base(&self, _queue_index: usize, _base: u16) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_call(
-                &self,
-                _queue_index: usize,
-                _fd: &EventFd,
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_kick(
-                &self,
-                _queue_index: usize,
-                _fd: &EventFd,
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-
-            fn set_vring_enable(
-                &mut self,
-                _queue_index: usize,
-                _enable: bool,
-            ) -> Result<(), vhost::Error> {
-                Ok(())
-            }
-        }
-
-        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
-            fn process(&mut self, _: Events, _: &mut EventOps) {}
-            fn init(&mut self, _: &mut EventOps) {}
-        }
-
-        let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
-        let vhost_block_config = VhostUserBlockConfig {
-            drive_id: "test_drive".to_string(),
-            partuuid: None,
-            is_root_device: false,
-            cache_type: CacheType::Unsafe,
-            socket: tmp_socket_path,
-        };
-        let mut vhost_block = VhostUserBlockImpl::<MockMaster>::new(vhost_block_config).unwrap();
-        assert_eq!(vhost_block.config_space, vec![0x1]);
-
-        // A config update before activation reads the new config from the
-        // backend and does not panic.
-        vhost_block.vu_handle.vu.config = vec![0x2];
-        vhost_block.config_update().unwrap();
-        assert_eq!(vhost_block.config_space, vec![0x2]);
-        assert!(vhost_block.config_change_pending);
-
+        let (mut vhost_block, mut backend) =
+            config_frontend_device("config_update_before_activation");
         let region_size = 0x10000;
         let file = TempFile::new().unwrap().into_file();
         file.set_len(region_size as u64).unwrap();
@@ -997,29 +1223,242 @@ mod tests {
         let guest_memory = create_mem(file, &regions, libc::MAP_SHARED);
         let q = VirtQueue::new(GuestAddress(0), &guest_memory, 16);
         vhost_block.queues[0] = q.create_queue();
-        let interrupt = Arc::new(IrqTrigger::new());
 
-        // Activation sends one config interrupt for the pending config change.
+        // A reply that comes before activation updates the config. The device sends the
+        // config interrupt when the guest driver activates it.
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        backend
+            .write_all(&get_config_reply(&[0x31; CONFIG_SIZE]))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.config_space, vec![0x31; CONFIG_SIZE]);
+        assert!(vhost_block.config_change_pending);
+
+        // A request that is in progress at activation sends its interrupt with the reply.
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+
+        let interrupt = Arc::new(IrqTrigger::new());
         vhost_block
             .activate(guest_memory, interrupt.clone())
             .unwrap();
         assert!(!vhost_block.config_change_pending);
-        assert_eq!(interrupt.irq_evt.read().unwrap(), 1);
+        assert_config_interrupt(&interrupt);
+
+        backend
+            .write_all(&get_config_reply(&[0x32; CONFIG_SIZE]))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.config_space, vec![0x32; CONFIG_SIZE]);
+        assert!(!vhost_block.config_change_pending);
+        assert_config_interrupt(&interrupt);
+    }
+
+    #[test]
+    fn test_config_update_errors() {
+        // The backend does not support config updates.
+        let (mut vhost_block, _backend) = config_frontend_device("config_update_errors_0");
+        vhost_block.vu_acked_protocol_features = 0;
+        assert!(matches!(
+            vhost_block.config_update(),
+            Err(VhostUserBlockError::ConfigNotSupported)
+        ));
+
+        // A backend error or a reply for another config region fails only this update.
+        let (mut vhost_block, mut backend) = config_frontend_device("config_update_errors_1");
+        let interrupt = activate_with_irq(&mut vhost_block);
+        vhost_block.config_update().unwrap();
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        backend
+            .write_all(&header(
+                u32::from(FrontendReq::GET_CONFIG),
+                0x1 | VhostUserHeaderFlag::REPLY.bits(),
+                0,
+            ))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 1);
+        assert_no_interrupt(&interrupt);
+        // The queued update sends its request.
+        read_request(&mut backend);
+        let mut wrong_size = get_config_reply(&[0x41; CONFIG_SIZE]);
+        wrong_size[16..20].copy_from_slice(&1u32.to_ne_bytes());
+        backend.write_all(&wrong_size).unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 2);
+        assert!(!vhost_block.config_reply_expected());
+        assert_eq!(vhost_block.config_space, vec![0; CONFIG_SIZE]);
+        assert_no_interrupt(&interrupt);
+        // The socket is still usable.
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        backend
+            .write_all(&get_config_reply(&[0x42; CONFIG_SIZE]))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert_eq!(vhost_block.config_space, vec![0x42; CONFIG_SIZE]);
+        assert_config_interrupt(&interrupt);
+
+        // An invalid reply header stops config updates: the start of the next reply is not
+        // known.
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        backend
+            .write_all(&header(u32::from(FrontendReq::GET_FEATURES), 0x5, 8))
+            .unwrap();
+        vhost_block.process_config_reply();
+        assert!(matches!(vhost_block.config_update, ConfigUpdate::Failed));
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 3);
+        assert!(matches!(
+            vhost_block.config_update(),
+            Err(VhostUserBlockError::ConfigSocketFailed)
+        ));
+        assert_eq!(vhost_block.config_space, vec![0x42; CONFIG_SIZE]);
+
+        // The backend closes the socket while a request waits for its reply.
+        let (mut vhost_block, mut backend) = config_frontend_device("config_update_errors_2");
+        vhost_block.config_update().unwrap();
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+        backend
+            .write_all(&get_config_reply(&[0x51; CONFIG_SIZE])[..10])
+            .unwrap();
+        drop(backend);
+        vhost_block.process_config_reply();
+        assert!(matches!(vhost_block.config_update, ConfigUpdate::Failed));
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 1);
+        assert!(!vhost_block.config_change_pending);
+
+        // The backend is gone before the request.
+        let (mut vhost_block, backend) = config_frontend_device("config_update_errors_3");
+        drop(backend);
+        assert!(matches!(
+            vhost_block.config_update(),
+            Err(VhostUserBlockError::ConfigRequest(_))
+        ));
+        assert!(matches!(vhost_block.config_update, ConfigUpdate::Failed));
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 1);
+
+        // The socket buffer is full: the request is not sent, and the socket stays usable.
+        let (mut vhost_block, mut backend) = config_frontend_device("config_update_errors_4");
+        let chunk = [0u8; 4096];
+        let mut sent = 0;
+        loop {
+            // SAFETY: `chunk` is a valid buffer. The return value is checked.
+            let ret = unsafe {
+                libc::send(
+                    vhost_block.vu_handle.vu.sock.as_raw_fd(),
+                    chunk.as_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            match usize::try_from(ret) {
+                Ok(count) => sent += count,
+                Err(_) => break,
+            }
+        }
+        match vhost_block.config_update() {
+            Err(VhostUserBlockError::ConfigRequest(err)) => {
+                assert_eq!(err.kind(), io::ErrorKind::WouldBlock)
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+        assert!(matches!(vhost_block.config_update, ConfigUpdate::Idle));
+        assert_eq!(vhost_block.metrics.cfg_fails.count(), 1);
+        let mut filler = vec![0u8; sent];
+        backend.read_exact(&mut filler).unwrap();
+        vhost_block.config_update().unwrap();
+        read_request(&mut backend);
+    }
+
+    #[test]
+    fn test_config_update_event_handler() {
+        let (sock, mut backend) = UnixStream::pair().unwrap();
+        let vhost_block = config_test_device(
+            "config_update_event_handler",
+            Frontend::from_stream(sock, NUM_QUEUES),
+        );
+        let vhost_block = Arc::new(Mutex::new(vhost_block));
+        let mut event_manager = EventManager::new().unwrap();
+        let _id = event_manager.add_subscriber(vhost_block.clone());
+        let interrupt = activate_with_irq(&mut *vhost_block.lock().unwrap());
+
+        // The device does not watch the socket while no request is in progress.
+        backend.write_all(&[0]).unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 0);
+        let mut byte = [0u8; 1];
+        // SAFETY: `byte` is a valid buffer. The return value is checked.
+        let ret = unsafe {
+            libc::recv(
+                vhost_block.lock().unwrap().vu_handle.vu.socket_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(ret, 1);
+
+        // The config update event makes the event loop watch the socket.
+        vhost_block.lock().unwrap().config_update().unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        assert!(vhost_block.lock().unwrap().config_reply_watched);
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 0);
+
+        // The event loop reads the reply and stops to watch the socket.
+        read_request(&mut backend);
+        backend
+            .write_all(&get_config_reply(&[0x61; CONFIG_SIZE]))
+            .unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        {
+            let vhost_block = vhost_block.lock().unwrap();
+            assert_eq!(vhost_block.config_space, vec![0x61; CONFIG_SIZE]);
+            assert!(!vhost_block.config_reply_watched);
+            assert!(!vhost_block.config_reply_expected());
+        }
+        assert_config_interrupt(&interrupt);
+        backend.write_all(&[0]).unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 0);
+
+        // The reply can come before the guest driver activates the device.
+        vhost_block.lock().unwrap().device_state = DeviceState::Inactive;
+        // SAFETY: `byte` is a valid buffer. The return value is checked.
+        let ret = unsafe {
+            libc::recv(
+                vhost_block.lock().unwrap().vu_handle.vu.socket_fd(),
+                byte.as_mut_ptr().cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        assert_eq!(ret, 1);
+        vhost_block.lock().unwrap().config_update().unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        read_request(&mut backend);
+        backend
+            .write_all(&get_config_reply(&[0x62; CONFIG_SIZE]))
+            .unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        assert!(vhost_block.lock().unwrap().config_change_pending);
         assert_eq!(
-            interrupt.irq_status.load(Ordering::SeqCst),
-            VIRTIO_MMIO_INT_CONFIG
+            vhost_block.lock().unwrap().config_space,
+            vec![0x62; CONFIG_SIZE]
         );
 
-        // A config update after activation sends the config interrupt at once.
-        interrupt.irq_status.store(0, Ordering::SeqCst);
-        vhost_block.vu_handle.vu.config = vec![0x3];
-        vhost_block.config_update().unwrap();
-        assert_eq!(vhost_block.config_space, vec![0x3]);
-        assert!(!vhost_block.config_change_pending);
-        assert_eq!(interrupt.irq_evt.read().unwrap(), 1);
-        assert_eq!(
-            interrupt.irq_status.load(Ordering::SeqCst),
-            VIRTIO_MMIO_INT_CONFIG
-        );
+        // When the backend closes the socket, the event loop stops to watch it.
+        vhost_block.lock().unwrap().config_update().unwrap();
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        drop(backend);
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 1);
+        {
+            let vhost_block = vhost_block.lock().unwrap();
+            assert!(matches!(vhost_block.config_update, ConfigUpdate::Failed));
+            assert!(!vhost_block.config_reply_watched);
+            assert_eq!(vhost_block.metrics.cfg_fails.count(), 1);
+        }
+        assert_eq!(event_manager.run_with_timeout(0).unwrap(), 0);
     }
 }
