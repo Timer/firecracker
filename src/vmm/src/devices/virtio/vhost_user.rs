@@ -4,19 +4,28 @@
 // Portions Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::os::fd::AsRawFd;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 
 use vhost::vhost_user::message::*;
 use vhost::vhost_user::{Frontend, VhostUserFrontend};
 use vhost::{Error as VhostError, VhostBackend, VhostUserMemoryRegionInfo, VringConfigData};
-use vm_memory::{Address, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
+use vm_memory::{Address, ByteValued, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 use vmm_sys_util::eventfd::EventFd;
 
 use crate::devices::virtio::queue::Queue;
 use crate::devices::virtio::transport::{VirtioInterrupt, VirtioInterruptType};
 use crate::vstate::memory::GuestMemoryMmap;
+
+/// Size of the vhost-user message header. The header has three 32-bit fields in the host
+/// byte order: the request code, the flags, and the size of the payload.
+const VHOST_USER_HEADER_SIZE: usize = 12;
+/// Size of the body of a `VHOST_USER_GET_CONFIG` message, before the config payload.
+const VHOST_USER_CONFIG_BODY_SIZE: usize = std::mem::size_of::<VhostUserConfig>();
+/// Protocol version 1 in the flags field of the header.
+const VHOST_USER_VERSION: u32 = 0x1;
 
 /// vhost-user error.
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -57,6 +66,145 @@ pub enum VhostUserError {
     UsedAddress(GuestMemoryError),
 }
 
+/// Error in the reply to a `VHOST_USER_GET_CONFIG` request.
+#[derive(Debug, thiserror::Error, displaydoc::Display)]
+pub enum VhostUserConfigReplyError {
+    /// The backend closed the connection
+    Disconnected,
+    /// Cannot read the reply: {0}
+    Read(io::Error),
+    /// Invalid reply header: request {request}, flags {flags:#x}, size {size}
+    InvalidHeader {
+        /// Request code in the header.
+        request: u32,
+        /// Flags in the header.
+        flags: u32,
+        /// Payload size in the header.
+        size: u32,
+    },
+    /// The backend could not get the device config
+    BackendFailed,
+    /// The reply has a config region that was not requested: offset {offset}, size {size}
+    InvalidConfig {
+        /// Offset of the config region in the reply.
+        offset: u32,
+        /// Size of the config region in the reply.
+        size: u32,
+    },
+}
+
+impl VhostUserConfigReplyError {
+    /// Returns true if the socket cannot carry more replies: the socket is closed or failed,
+    /// or the start of the next reply is not known.
+    pub fn is_fatal(&self) -> bool {
+        !matches!(self, Self::BackendFailed | Self::InvalidConfig { .. })
+    }
+}
+
+/// Reads the reply to a `VHOST_USER_GET_CONFIG` request without blocking.
+///
+/// The reply can arrive in parts. Call [`VhostUserConfigReply::read`] each time the socket
+/// is readable, until it returns the config.
+#[derive(Debug)]
+pub struct VhostUserConfigReply {
+    offset: u32,
+    size: u32,
+    // Header, body, and config payload of the reply.
+    buf: Vec<u8>,
+    // Number of bytes in `buf` that came from the socket.
+    len: usize,
+}
+
+impl VhostUserConfigReply {
+    /// Make a reader for the reply to a request for `size` bytes of config at `offset`.
+    pub fn new(offset: u32, size: u32) -> Self {
+        Self {
+            offset,
+            size,
+            buf: vec![0; VHOST_USER_HEADER_SIZE + VHOST_USER_CONFIG_BODY_SIZE + size as usize],
+            len: 0,
+        }
+    }
+
+    /// Read the bytes that are available on the socket `fd`, and do not wait for more.
+    ///
+    /// Returns `Ok(None)` if the reply is not complete, and the config when it is complete.
+    /// The reader does not read past the end of the reply. A reply cannot carry file
+    /// descriptors: the kernel closes the file descriptors that a backend attaches, because
+    /// the reader does not receive control messages.
+    pub fn read(&mut self, fd: RawFd) -> Result<Option<Vec<u8>>, VhostUserConfigReplyError> {
+        loop {
+            let end = self.reply_len()?;
+            if self.len == end {
+                return self.config().map(Some);
+            }
+            let dst = &mut self.buf[self.len..end];
+            // SAFETY: `dst` is a valid buffer of `dst.len()` bytes that we can write. `recv`
+            // writes at most `dst.len()` bytes and does not keep the pointer. The return
+            // value is checked. The standard library cannot read with `MSG_DONTWAIT`, and
+            // non-blocking mode on the socket would also change the blocking calls of the
+            // vhost crate.
+            let ret =
+                unsafe { libc::recv(fd, dst.as_mut_ptr().cast(), dst.len(), libc::MSG_DONTWAIT) };
+            match usize::try_from(ret) {
+                Ok(0) => return Err(VhostUserConfigReplyError::Disconnected),
+                Ok(count) => self.len += count,
+                Err(_) => {
+                    let err = io::Error::last_os_error();
+                    match err.kind() {
+                        io::ErrorKind::WouldBlock => return Ok(None),
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(VhostUserConfigReplyError::Read(err)),
+                    }
+                }
+            }
+        }
+    }
+
+    // Length of the reply. Until the header is complete, this is the header size.
+    fn reply_len(&self) -> Result<usize, VhostUserConfigReplyError> {
+        if self.len < VHOST_USER_HEADER_SIZE {
+            return Ok(VHOST_USER_HEADER_SIZE);
+        }
+        let field = |index: usize| {
+            let start = index * 4;
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&self.buf[start..start + 4]);
+            u32::from_ne_bytes(bytes)
+        };
+        let (request, flags, size) = (field(0), field(1), field(2));
+        let header_is_valid = request == u32::from(FrontendReq::GET_CONFIG)
+            && flags & VhostUserHeaderFlag::VERSION.bits() == VHOST_USER_VERSION
+            && flags & VhostUserHeaderFlag::REPLY.bits() != 0
+            && flags & VhostUserHeaderFlag::RESERVED_BITS.bits() == 0;
+        // A backend that cannot get the config replies with an empty payload.
+        if header_is_valid && size == 0 {
+            return Err(VhostUserConfigReplyError::BackendFailed);
+        }
+        if !header_is_valid || size as usize != self.buf.len() - VHOST_USER_HEADER_SIZE {
+            return Err(VhostUserConfigReplyError::InvalidHeader {
+                request,
+                flags,
+                size,
+            });
+        }
+        Ok(self.buf.len())
+    }
+
+    // Validate the body of a complete reply and return the config payload.
+    fn config(&self) -> Result<Vec<u8>, VhostUserConfigReplyError> {
+        let (body, payload) =
+            self.buf[VHOST_USER_HEADER_SIZE..].split_at(VHOST_USER_CONFIG_BODY_SIZE);
+        let mut reply = VhostUserConfig::default();
+        reply.as_mut_slice().copy_from_slice(body);
+        let (offset, size) = (reply.offset, reply.size);
+        if !reply.is_valid() || offset != self.offset || size != self.size {
+            return Err(VhostUserConfigReplyError::InvalidConfig { offset, size });
+        }
+        Ok(payload.to_vec())
+    }
+}
+
 // Trait with all methods we use from `Frontend` from vhost crate.
 // It allows us to create a mock implementation of the `Frontend`
 // to verify calls to the backend.
@@ -64,6 +212,11 @@ pub enum VhostUserError {
 pub trait VhostUserHandleBackend: Sized {
     /// Constructor of `Frontend`
     fn from_stream(_sock: UnixStream, _max_queue_num: u64) -> Self {
+        unimplemented!()
+    }
+
+    /// Get the file descriptor of the socket to the backend.
+    fn socket_fd(&self) -> RawFd {
         unimplemented!()
     }
 
@@ -165,6 +318,10 @@ pub trait VhostUserHandleBackend: Sized {
 impl VhostUserHandleBackend for Frontend {
     fn from_stream(sock: UnixStream, max_queue_num: u64) -> Self {
         Frontend::from_stream(sock, max_queue_num)
+    }
+
+    fn socket_fd(&self) -> RawFd {
+        self.as_raw_fd()
     }
 
     fn set_hdr_flags(&self, flags: VhostUserHeaderFlag) {
@@ -363,6 +520,61 @@ impl<T: VhostUserHandleBackend> VhostUserHandleImpl<T> {
         Ok((acked_features, acked_protocol_features.bits()))
     }
 
+    /// Send a `VHOST_USER_GET_CONFIG` request and do not wait for the reply. Use
+    /// [`VhostUserConfigReply`] to read the reply.
+    ///
+    /// The send does not block. If the socket buffer is full, the send fails with
+    /// [`io::ErrorKind::WouldBlock`] and sends nothing. After another error, the state of
+    /// the socket is not known.
+    pub fn send_get_config(
+        &self,
+        offset: u32,
+        size: u32,
+        flags: VhostUserConfigFlags,
+    ) -> io::Result<()> {
+        let body = VhostUserConfig::new(offset, size, flags);
+        if !body.is_valid() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        // The `vhost` crate does not export its message header type, so encode the header
+        // here. The payload of the request has the size of the requested config.
+        let payload_size = VHOST_USER_CONFIG_BODY_SIZE + size as usize;
+        let mut msg = Vec::with_capacity(VHOST_USER_HEADER_SIZE + payload_size);
+        msg.extend_from_slice(&u32::from(FrontendReq::GET_CONFIG).to_ne_bytes());
+        msg.extend_from_slice(&VHOST_USER_VERSION.to_ne_bytes());
+        msg.extend_from_slice(
+            &u32::try_from(payload_size)
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?
+                .to_ne_bytes(),
+        );
+        msg.extend_from_slice(body.as_slice());
+        msg.resize(VHOST_USER_HEADER_SIZE + payload_size, 0);
+
+        loop {
+            // SAFETY: `msg` is a valid buffer of `msg.len()` bytes. `send` reads at most
+            // `msg.len()` bytes and does not keep the pointer. The return value is checked.
+            // The standard library cannot write with `MSG_DONTWAIT`.
+            let ret = unsafe {
+                libc::send(
+                    self.vu.socket_fd(),
+                    msg.as_ptr().cast(),
+                    msg.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            match usize::try_from(ret) {
+                Ok(count) if count == msg.len() => return Ok(()),
+                Ok(_) => return Err(io::Error::other("sent only part of the request")),
+                Err(_) => {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+    }
+
     /// Update guest memory table to the backend.
     fn update_mem_table(&self, mem: &GuestMemoryMmap) -> Result<(), VhostUserError> {
         let mut regions: Vec<VhostUserMemoryRegionInfo> = Vec::new();
@@ -470,6 +682,7 @@ pub(crate) mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
 
     use std::fs::File;
+    use std::io::{Read, Write};
 
     use vmm_sys_util::tempfile::TempFile;
 
@@ -478,6 +691,47 @@ pub(crate) mod tests {
     use crate::test_utils::create_tmp_socket;
     use crate::vstate::memory;
     use crate::vstate::memory::{FileOffset, GuestAddress, GuestRegionMmapExt};
+
+    /// A frontend that only has a socket to the backend.
+    pub(crate) struct SocketFrontend {
+        pub(crate) sock: UnixStream,
+    }
+
+    impl VhostUserHandleBackend for SocketFrontend {
+        fn socket_fd(&self) -> RawFd {
+            self.sock.as_raw_fd()
+        }
+    }
+
+    /// Length of a `VHOST_USER_GET_CONFIG` request for `size` bytes of config.
+    pub(crate) fn get_config_request_len(size: usize) -> usize {
+        VHOST_USER_HEADER_SIZE + VHOST_USER_CONFIG_BODY_SIZE + size
+    }
+
+    /// Encode a vhost-user message header.
+    pub(crate) fn header(request: u32, flags: u32, size: usize) -> Vec<u8> {
+        let mut msg = request.to_ne_bytes().to_vec();
+        msg.extend_from_slice(&flags.to_ne_bytes());
+        msg.extend_from_slice(&u32::try_from(size).unwrap().to_ne_bytes());
+        msg
+    }
+
+    /// Encode a `VHOST_USER_GET_CONFIG` reply with `config` at offset 0.
+    pub(crate) fn get_config_reply(config: &[u8]) -> Vec<u8> {
+        let body = VhostUserConfig::new(
+            0,
+            u32::try_from(config.len()).unwrap(),
+            VhostUserConfigFlags::WRITABLE,
+        );
+        let mut msg = header(
+            u32::from(FrontendReq::GET_CONFIG),
+            VHOST_USER_VERSION | VhostUserHeaderFlag::REPLY.bits(),
+            VHOST_USER_CONFIG_BODY_SIZE + config.len(),
+        );
+        msg.extend_from_slice(body.as_slice());
+        msg.extend_from_slice(config);
+        msg
+    }
 
     pub(crate) fn create_mem(
         file: File,
@@ -1016,5 +1270,175 @@ pub(crate) mod tests {
         assert_eq!(result[0].call, expected_config.call);
         assert_eq!(result[0].kick, expected_config.kick);
         assert_eq!(result[0].enable, expected_config.enable);
+    }
+
+    #[test]
+    fn test_send_get_config() {
+        let (frontend, mut backend) = UnixStream::pair().unwrap();
+        let vuh = VhostUserHandleImpl {
+            vu: SocketFrontend { sock: frontend },
+            socket_path: "".to_string(),
+        };
+
+        // The request has the header, the body, and a payload of the requested size.
+        vuh.send_get_config(4, 8, VhostUserConfigFlags::WRITABLE)
+            .unwrap();
+        let mut request = vec![0u8; get_config_request_len(8)];
+        backend.read_exact(&mut request).unwrap();
+        let mut expected = header(
+            u32::from(FrontendReq::GET_CONFIG),
+            VHOST_USER_VERSION,
+            VHOST_USER_CONFIG_BODY_SIZE + 8,
+        );
+        expected.extend_from_slice(
+            VhostUserConfig::new(4, 8, VhostUserConfigFlags::WRITABLE).as_slice(),
+        );
+        expected.extend_from_slice(&[0u8; 8]);
+        assert_eq!(request, expected);
+
+        // A request for no config, or for a region outside the config space, is not sent.
+        assert_eq!(
+            vuh.send_get_config(0, 0, VhostUserConfigFlags::WRITABLE)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            vuh.send_get_config(VHOST_USER_CONFIG_SIZE, 1, VhostUserConfigFlags::WRITABLE)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // When the socket buffer is full, the send fails at once.
+        let chunk = [0u8; 4096];
+        loop {
+            // SAFETY: `chunk` is a valid buffer. The return value is checked.
+            let ret = unsafe {
+                libc::send(
+                    vuh.vu.sock.as_raw_fd(),
+                    chunk.as_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                break;
+            }
+        }
+        assert_eq!(
+            vuh.send_get_config(0, 8, VhostUserConfigFlags::WRITABLE)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        // When the backend is gone, the send fails and does not raise SIGPIPE.
+        drop(backend);
+        assert_eq!(
+            vuh.send_get_config(0, 8, VhostUserConfigFlags::WRITABLE)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+    }
+
+    #[test]
+    fn test_config_reply() {
+        let (frontend, mut backend) = UnixStream::pair().unwrap();
+        let fd = frontend.as_raw_fd();
+        let config = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let msg = get_config_reply(&config);
+
+        // A complete reply.
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        assert!(reply.read(fd).unwrap().is_none());
+        backend.write_all(&msg).unwrap();
+        assert_eq!(reply.read(fd).unwrap().unwrap(), config);
+
+        // A reply that arrives one byte at a time.
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        for byte in &msg[..msg.len() - 1] {
+            backend.write_all(&[*byte]).unwrap();
+            assert!(reply.read(fd).unwrap().is_none());
+        }
+        backend.write_all(&msg[msg.len() - 1..]).unwrap();
+        assert_eq!(reply.read(fd).unwrap().unwrap(), config);
+
+        // The reader does not read past the end of the reply.
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        backend.write_all(&msg).unwrap();
+        backend.write_all(&msg).unwrap();
+        assert_eq!(reply.read(fd).unwrap().unwrap(), config);
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        assert_eq!(reply.read(fd).unwrap().unwrap(), config);
+
+        // A reply with an empty payload tells that the backend failed. The reader reads only
+        // the header, so the next reply can follow.
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        let failed = header(
+            u32::from(FrontendReq::GET_CONFIG),
+            VHOST_USER_VERSION | VhostUserHeaderFlag::REPLY.bits(),
+            0,
+        );
+        backend.write_all(&failed).unwrap();
+        backend.write_all(&msg).unwrap();
+        let err = reply.read(fd).unwrap_err();
+        assert!(matches!(err, VhostUserConfigReplyError::BackendFailed));
+        assert!(!err.is_fatal());
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        assert_eq!(reply.read(fd).unwrap().unwrap(), config);
+
+        // A reply for a different config region.
+        let mut reply = VhostUserConfigReply::new(4, 8);
+        backend.write_all(&msg).unwrap();
+        let err = reply.read(fd).unwrap_err();
+        assert!(matches!(
+            err,
+            VhostUserConfigReplyError::InvalidConfig { offset: 0, size: 8 }
+        ));
+        assert!(!err.is_fatal());
+
+        // Headers that are not a valid reply to the request.
+        let reply_flags = VHOST_USER_VERSION | VhostUserHeaderFlag::REPLY.bits();
+        let size = VHOST_USER_CONFIG_BODY_SIZE + 8;
+        for (request, flags, size) in [
+            (u32::from(FrontendReq::GET_FEATURES), reply_flags, size),
+            (u32::from(FrontendReq::GET_CONFIG), VHOST_USER_VERSION, size),
+            (
+                u32::from(FrontendReq::GET_CONFIG),
+                0x2 | VhostUserHeaderFlag::REPLY.bits(),
+                size,
+            ),
+            (u32::from(FrontendReq::GET_CONFIG), reply_flags | 0x10, size),
+            (u32::from(FrontendReq::GET_CONFIG), reply_flags, size + 1),
+        ] {
+            let (frontend, mut backend) = UnixStream::pair().unwrap();
+            let mut reply = VhostUserConfigReply::new(0, 8);
+            backend.write_all(&header(request, flags, size)).unwrap();
+            let err = reply.read(frontend.as_raw_fd()).unwrap_err();
+            assert!(
+                matches!(err, VhostUserConfigReplyError::InvalidHeader { .. }),
+                "{err}"
+            );
+            assert!(err.is_fatal());
+        }
+
+        // The backend closes the socket in the middle of a reply.
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        backend.write_all(&msg[..20]).unwrap();
+        assert!(reply.read(fd).unwrap().is_none());
+        drop(backend);
+        let err = reply.read(fd).unwrap_err();
+        assert!(matches!(err, VhostUserConfigReplyError::Disconnected));
+        assert!(err.is_fatal());
+
+        // The socket fails.
+        let not_a_socket = EventFd::new(libc::EFD_NONBLOCK).unwrap();
+        let mut reply = VhostUserConfigReply::new(0, 8);
+        let err = reply.read(not_a_socket.as_raw_fd()).unwrap_err();
+        assert!(matches!(err, VhostUserConfigReplyError::Read(_)));
+        assert!(err.is_fatal());
     }
 }

@@ -5,6 +5,7 @@
 import time
 
 import pytest
+from tenacity import Retrying, stop_after_delay, wait_fixed
 
 import host_tools.drive as drive_tools
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
@@ -75,6 +76,15 @@ def test_vhost_user_block_metrics(uvm, vcpu_count, metrics):
         # Instruct Firecracker to reread device config and notify
         # the guest of a config change.
         vm.patch_drive("scratch")
+
+        # Firecracker responds before the backend replies, so wait until the
+        # guest has the new config.
+        for attempt in Retrying(
+            wait=wait_fixed(0.1), stop=stop_after_delay(10), reraise=True
+        ):
+            with attempt:
+                _, stdout, _ = vm.ssh.check_output("blockdev --getsize64 /dev/vdb")
+                assert stdout.strip() == str(new_size * 1024 * 1024)
 
         fc_metrics = vm.flush_metrics()
         assert 0 == fc_metrics["vhost_user_block_scratch"]["cfg_fails"]

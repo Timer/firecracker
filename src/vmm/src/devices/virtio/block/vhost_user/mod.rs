@@ -7,7 +7,6 @@ pub mod persist;
 
 use self::device::VhostUserBlock;
 use crate::devices::virtio::vhost_user::VhostUserError;
-use crate::vstate::interrupts::InterruptError;
 
 /// Number of queues for the vhost-user block device.
 pub const NUM_QUEUES: u64 = 1;
@@ -28,6 +27,10 @@ pub enum VhostUserBlockError {
     Vhost(vhost::Error),
     /// Error opening eventfd: {0}
     EventFd(std::io::Error),
-    /// Error creating irqfd: {0}
-    Interrupt(InterruptError),
+    /// The backend does not support config updates
+    ConfigNotSupported,
+    /// Cannot send the config request to the backend: {0}
+    ConfigRequest(std::io::Error),
+    /// Config updates are not possible after an error on the backend socket
+    ConfigSocketFailed,
 }

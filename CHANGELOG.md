@@ -53,6 +53,12 @@ and this project adheres to
   largest frame needs, instead of every buffer the guest has made available.
   This lowers the cost of receiving each frame and improves receive throughput
   for small packets.
+- [#6324](https://github.com/firecracker-microvm/firecracker/issues/6324): A
+  `PATCH /drives/{id}` request to a vhost-user block device no longer waits for
+  the reply of the backend. The API responds when Firecracker has sent the
+  `VHOST_USER_GET_CONFIG` request. Firecracker updates the config and notifies
+  the guest when the reply arrives. Errors from the backend are logged and
+  counted in the `cfg_fails` metric, and are not returned in the response.
 
 ### Deprecated
 
@@ -119,6 +125,11 @@ and this project adheres to
   device that the guest driver has not activated yet. Firecracker now reads the
   new config from the backend and sends the config change notification when the
   guest driver activates the device.
+
+- [#6324](https://github.com/firecracker-microvm/firecracker/issues/6324): Fixed
+  a `PATCH /drives/{id}` request to a vhost-user block device blocking the VMM
+  thread until the backend replied. During the wait, the API did not respond and
+  the devices that the VMM thread serves, such as virtio-block drives, stopped.
 
 ## [1.17.0]
 
