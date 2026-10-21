@@ -140,4 +140,5 @@ curl --unix-socket ${socket} -i \
 
 A `PATCH` request to a vhost-user drive will make Firecracker retrieve the new
 device config from the backend and send a config change notification to the
-guest.
+guest. If the guest driver has not activated the device yet, Firecracker sends
+the notification when the driver activates the device.

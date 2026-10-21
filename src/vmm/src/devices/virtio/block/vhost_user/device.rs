@@ -25,7 +25,7 @@ use crate::devices::virtio::vhost_user::{VhostUserHandleBackend, VhostUserHandle
 use crate::devices::virtio::vhost_user_metrics::{
     VhostUserDeviceMetrics, VhostUserMetricsPerDevice,
 };
-use crate::logger::{IncMetric, StoreMetric, log_dev_preview_warning};
+use crate::logger::{IncMetric, StoreMetric, error, log_dev_preview_warning};
 use crate::utils::u64_to_usize;
 use crate::vmm_config::drive::BlockDeviceConfig;
 use crate::vstate::memory::GuestMemoryMmap;
@@ -126,6 +126,9 @@ pub struct VhostUserBlockImpl<T: VhostUserHandleBackend> {
     pub queues: Vec<Queue>,
     pub queue_evts: [EventFd; u64_to_usize(NUM_QUEUES)],
     pub device_state: DeviceState,
+    /// The config space changed while the device was not active. The guest
+    /// driver gets a config change notification when it activates the device.
+    pub config_change_pending: bool,
 
     // Implementation specific fields.
     pub id: String,
@@ -151,6 +154,7 @@ impl<T: VhostUserHandleBackend> std::fmt::Debug for VhostUserBlockImpl<T> {
             .field("queues", &self.queues)
             .field("queue_evts", &self.queue_evts)
             .field("device_state", &self.device_state)
+            .field("config_change_pending", &self.config_change_pending)
             .field("id", &self.id)
             .field("partuuid", &self.partuuid)
             .field("cache_type", &self.cache_type)
@@ -235,6 +239,7 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
             queues,
             queue_evts,
             device_state,
+            config_change_pending: false,
 
             id: config.drive_id,
             partuuid: config.partuuid,
@@ -265,12 +270,6 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
 
     pub fn config_update(&mut self) -> Result<(), VhostUserBlockError> {
         let start_time = get_time_us(ClockType::Monotonic);
-        let interrupt = self
-            .device_state
-            .active_state()
-            .expect("Device is not initialized")
-            .interrupt
-            .clone();
 
         // This buffer is used for config size check in vhost crate.
         let buffer = [0u8; BLOCK_CONFIG_SPACE_SIZE as usize];
@@ -285,9 +284,16 @@ impl<T: VhostUserHandleBackend> VhostUserBlockImpl<T> {
             )
             .map_err(VhostUserBlockError::Vhost)?;
         self.config_space = new_config_space;
-        interrupt
-            .trigger(VirtioInterruptType::Config)
-            .map_err(VhostUserBlockError::Interrupt)?;
+
+        match self.device_state.active_state() {
+            Some(state) => state
+                .interrupt
+                .trigger(VirtioInterruptType::Config)
+                .map_err(VhostUserBlockError::Interrupt)?,
+            // The guest driver can read the config space before it activates the
+            // device, so it can have the old config. Notify it at activation.
+            None => self.config_change_pending = true,
+        }
 
         let delta_us = get_time_us(ClockType::Monotonic) - start_time;
         self.metrics.config_change_time_us.store(delta_us);
@@ -376,6 +382,11 @@ where
                 self.metrics.activate_fails.inc();
                 ActivateError::VhostUser(err)
             })?;
+        if std::mem::take(&mut self.config_change_pending)
+            && let Err(err) = interrupt.trigger(VirtioInterruptType::Config)
+        {
+            error!("Failed to send the pending config change interrupt: {err}");
+        }
         self.device_state = DeviceState::Activated(ActiveState { mem, interrupt });
         let delta_us = get_time_us(ClockType::Monotonic) - start_time;
         self.metrics.activate_time_us.store(delta_us);
@@ -413,7 +424,7 @@ mod tests {
     use super::*;
     use crate::devices::virtio::block::virtio::device::FileEngineType;
     use crate::devices::virtio::test_utils::{VirtQueue, default_interrupt, default_mem};
-    use crate::devices::virtio::transport::mmio::VIRTIO_MMIO_INT_CONFIG;
+    use crate::devices::virtio::transport::mmio::{IrqTrigger, VIRTIO_MMIO_INT_CONFIG};
     use crate::devices::virtio::vhost_user::tests::create_mem;
     use crate::test_utils::create_tmp_socket;
     use crate::vstate::memory::GuestAddress;
@@ -851,10 +862,164 @@ mod tests {
         let interrupt = default_interrupt();
 
         // During actiavion of the device features, memory and queues should be set and activated.
-        vhost_block.activate(guest_memory, interrupt).unwrap();
+        vhost_block
+            .activate(guest_memory, interrupt.clone())
+            .unwrap();
         assert!(unsafe { *vhost_block.vu_handle.vu.features_are_set.get() });
         assert!(unsafe { *vhost_block.vu_handle.vu.memory_is_set.get() });
         assert!(unsafe { *vhost_block.vu_handle.vu.vring_enabled.get() });
         assert!(vhost_block.is_activated());
+        // No config change is pending, so activation sends no config interrupt.
+        assert!(!interrupt.has_pending_interrupt(VirtioInterruptType::Config));
+    }
+
+    #[test]
+    fn test_config_update_before_activation() {
+        struct MockMaster {
+            config: VhostUserConfigPayload,
+        }
+
+        impl VhostUserHandleBackend for MockMaster {
+            fn from_stream(_sock: UnixStream, _max_queue_num: u64) -> Self {
+                Self { config: vec![0x1] }
+            }
+
+            fn set_owner(&self) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_hdr_flags(&self, _flags: VhostUserHeaderFlag) {}
+
+            fn get_features(&self) -> Result<u64, vhost::Error> {
+                Ok(VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits())
+            }
+
+            fn get_protocol_features(&mut self) -> Result<VhostUserProtocolFeatures, vhost::Error> {
+                Ok(VhostUserProtocolFeatures::CONFIG)
+            }
+
+            fn set_protocol_features(
+                &mut self,
+                _features: VhostUserProtocolFeatures,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn get_config(
+                &mut self,
+                _offset: u32,
+                _size: u32,
+                _flags: VhostUserConfigFlags,
+                _buf: &[u8],
+            ) -> Result<(VhostUserConfig, VhostUserConfigPayload), vhost::Error> {
+                Ok((VhostUserConfig::default(), self.config.clone()))
+            }
+
+            fn set_features(&self, _features: u64) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_mem_table(
+                &self,
+                _regions: &[VhostUserMemoryRegionInfo],
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_num(&self, _queue_index: usize, _num: u16) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_addr(
+                &self,
+                _queue_index: usize,
+                _config_data: &VringConfigData,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_base(&self, _queue_index: usize, _base: u16) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_call(
+                &self,
+                _queue_index: usize,
+                _fd: &EventFd,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_kick(
+                &self,
+                _queue_index: usize,
+                _fd: &EventFd,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+
+            fn set_vring_enable(
+                &mut self,
+                _queue_index: usize,
+                _enable: bool,
+            ) -> Result<(), vhost::Error> {
+                Ok(())
+            }
+        }
+
+        impl MutEventSubscriber for VhostUserBlockImpl<MockMaster> {
+            fn process(&mut self, _: Events, _: &mut EventOps) {}
+            fn init(&mut self, _: &mut EventOps) {}
+        }
+
+        let (_tmp_dir, tmp_socket_path) = create_tmp_socket();
+        let vhost_block_config = VhostUserBlockConfig {
+            drive_id: "test_drive".to_string(),
+            partuuid: None,
+            is_root_device: false,
+            cache_type: CacheType::Unsafe,
+            socket: tmp_socket_path,
+        };
+        let mut vhost_block = VhostUserBlockImpl::<MockMaster>::new(vhost_block_config).unwrap();
+        assert_eq!(vhost_block.config_space, vec![0x1]);
+
+        // A config update before activation reads the new config from the
+        // backend and does not panic.
+        vhost_block.vu_handle.vu.config = vec![0x2];
+        vhost_block.config_update().unwrap();
+        assert_eq!(vhost_block.config_space, vec![0x2]);
+        assert!(vhost_block.config_change_pending);
+
+        let region_size = 0x10000;
+        let file = TempFile::new().unwrap().into_file();
+        file.set_len(region_size as u64).unwrap();
+        let regions = vec![(GuestAddress(0x0), region_size)];
+        let guest_memory = create_mem(file, &regions, libc::MAP_SHARED);
+        let q = VirtQueue::new(GuestAddress(0), &guest_memory, 16);
+        vhost_block.queues[0] = q.create_queue();
+        let interrupt = Arc::new(IrqTrigger::new());
+
+        // Activation sends one config interrupt for the pending config change.
+        vhost_block
+            .activate(guest_memory, interrupt.clone())
+            .unwrap();
+        assert!(!vhost_block.config_change_pending);
+        assert_eq!(interrupt.irq_evt.read().unwrap(), 1);
+        assert_eq!(
+            interrupt.irq_status.load(Ordering::SeqCst),
+            VIRTIO_MMIO_INT_CONFIG
+        );
+
+        // A config update after activation sends the config interrupt at once.
+        interrupt.irq_status.store(0, Ordering::SeqCst);
+        vhost_block.vu_handle.vu.config = vec![0x3];
+        vhost_block.config_update().unwrap();
+        assert_eq!(vhost_block.config_space, vec![0x3]);
+        assert!(!vhost_block.config_change_pending);
+        assert_eq!(interrupt.irq_evt.read().unwrap(), 1);
+        assert_eq!(
+            interrupt.irq_status.load(Ordering::SeqCst),
+            VIRTIO_MMIO_INT_CONFIG
+        );
     }
 }
