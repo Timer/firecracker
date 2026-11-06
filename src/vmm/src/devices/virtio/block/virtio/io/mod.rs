@@ -134,6 +134,58 @@ impl FileEngine {
         }
     }
 
+    /// Reads into the guest memory `segments` in order, from the file starting at `offset`.
+    pub fn readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        match self {
+            FileEngine::Async(engine) => match engine.push_readv(offset, mem, segments, req) {
+                Ok(_) => Ok(FileEngineOk::Submitted),
+                Err(err) => Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Async(err.error),
+                }),
+            },
+            FileEngine::Sync(engine) => match engine.readv(offset, mem, segments) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Sync(err),
+                }),
+            },
+        }
+    }
+
+    /// Writes the guest memory `segments` in order, to the file starting at `offset`.
+    pub fn writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+        req: PendingRequest,
+    ) -> Result<FileEngineOk, RequestError<BlockIoError>> {
+        match self {
+            FileEngine::Async(engine) => match engine.push_writev(offset, mem, segments, req) {
+                Ok(_) => Ok(FileEngineOk::Submitted),
+                Err(err) => Err(RequestError {
+                    req: err.req,
+                    error: BlockIoError::Async(err.error),
+                }),
+            },
+            FileEngine::Sync(engine) => match engine.writev(offset, mem, segments) {
+                Ok(count) => Ok(FileEngineOk::Executed(RequestOk { req, count })),
+                Err(err) => Err(RequestError {
+                    req,
+                    error: BlockIoError::Sync(err),
+                }),
+            },
+        }
+    }
+
     pub fn flush(
         &mut self,
         req: PendingRequest,
@@ -200,6 +252,7 @@ impl FileEngine {
 pub mod tests {
     #![allow(clippy::undocumented_unsafe_blocks)]
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileExt;
 
     use vm_memory::{GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
     use vmm_sys_util::tempfile::TempFile;
@@ -214,6 +267,13 @@ pub mod tests {
     const FILE_LEN: u32 = 1024;
     // 2 pages of memory should be enough to test read/write ops and also dirty tracking.
     const MEM_LEN: usize = 8192;
+    // Guest buffers that split a transfer of FILE_LEN bytes unevenly and out of order over both
+    // pages of memory, with gaps between them.
+    const SEGMENTS: [(GuestAddress, u32); 3] = [
+        (GuestAddress(4096), 100),
+        (GuestAddress(0), 512),
+        (GuestAddress(1024), FILE_LEN - 612),
+    ];
 
     macro_rules! assert_sync_execution {
         ($expression:expr, $count:expr) => {
@@ -266,6 +326,30 @@ pub mod tests {
         for offset in addr.0..addr.0 + u64::from(len) {
             assert!(!bitmap.dirty_at(u64_to_usize(offset)));
         }
+    }
+
+    // Writes `data` into the SEGMENTS, in order.
+    fn write_segments(mem: &GuestMemoryMmap, mut data: &[u8]) {
+        for (addr, len) in SEGMENTS {
+            let (chunk, rest) = data.split_at(len as usize);
+            mem.write_slice(chunk, addr).unwrap();
+            data = rest;
+        }
+    }
+
+    // Checks that the SEGMENTS hold `data`, in order, and are marked dirty, and that nothing
+    // else in memory was written to.
+    fn check_segments(mem: &GuestMemoryMmap, mut data: &[u8]) {
+        let mut expected = vec![0u8; MEM_LEN];
+        for (addr, len) in SEGMENTS {
+            let (chunk, rest) = data.split_at(len as usize);
+            expected[u64_to_usize(addr.0)..][..chunk.len()].copy_from_slice(chunk);
+            check_dirty_mem(mem, addr, len);
+            data = rest;
+        }
+        let mut buf = vec![0u8; MEM_LEN];
+        mem.read_slice(&mut buf, GuestAddress(0)).unwrap();
+        assert_eq!(buf, expected);
     }
 
     #[test]
@@ -488,5 +572,92 @@ pub mod tests {
 
         engine.drain(true).unwrap();
         engine.drain_and_flush(true).unwrap();
+    }
+
+    #[test]
+    fn test_sync_vectored() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Sync).unwrap();
+        let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
+            .as_bytes()
+            .to_vec();
+        let offset = 512;
+
+        // The segments are written to consecutive bytes of the file.
+        let mem = create_mem();
+        write_segments(&mem, &data);
+        assert_sync_execution!(
+            engine.writev(offset, &mem, &SEGMENTS, PendingRequest::default()),
+            FILE_LEN
+        );
+        let mut buf = vec![0u8; FILE_LEN as usize];
+        engine.file().read_exact_at(&mut buf, offset).unwrap();
+        assert_eq!(buf, data);
+
+        // And read back from them.
+        let mem = create_mem();
+        assert_sync_execution!(
+            engine.readv(offset, &mem, &SEGMENTS, PendingRequest::default()),
+            FILE_LEN
+        );
+        check_segments(&mem, &data);
+
+        // A read past the end of the file fails, after filling and marking dirty only the
+        // first segment, in the second page.
+        let mem = create_mem();
+        let short_offset = offset + u64::from(FILE_LEN) - u64::from(SEGMENTS[0].1);
+        match engine.readv(short_offset, &mem, &SEGMENTS, PendingRequest::default()) {
+            Err(err) => assert!(matches!(
+                err.error,
+                BlockIoError::Sync(SyncIoError::Transfer(GuestMemoryError::IOError(_)))
+            )),
+            Ok(_) => panic!("read past the end of the file succeeded"),
+        }
+        check_dirty_mem(&mem, SEGMENTS[0].0, SEGMENTS[0].1);
+        check_clean_mem(&mem, GuestAddress(0), 4096);
+    }
+
+    #[test]
+    fn test_async_vectored() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut engine = FileEngine::from_file(file, FileEngineType::Async).unwrap();
+        let data = vmm_sys_util::rand::rand_alphanumerics(FILE_LEN as usize)
+            .as_bytes()
+            .to_vec();
+        let offset = 512;
+
+        // The segments are written to consecutive bytes of the file.
+        let mem = create_mem();
+        write_segments(&mem, &data);
+        assert_queued!(engine.writev(offset, &mem, &SEGMENTS, PendingRequest::default()));
+        assert_async_execution(&mem, &mut engine, FILE_LEN);
+        let mut buf = vec![0u8; FILE_LEN as usize];
+        engine.file().read_exact_at(&mut buf, offset).unwrap();
+        assert_eq!(buf, data);
+
+        // And read back from them.
+        let mem = create_mem();
+        assert_queued!(engine.readv(offset, &mem, &SEGMENTS, PendingRequest::default()));
+        assert_async_execution(&mem, &mut engine, FILE_LEN);
+        check_segments(&mem, &data);
+
+        // A read that reaches the end of the file stops short, and marks dirty only what it read:
+        // the first segment, in the second page.
+        let mem = create_mem();
+        let short_offset = offset + u64::from(FILE_LEN) - u64::from(SEGMENTS[0].1);
+        assert_queued!(engine.readv(short_offset, &mem, &SEGMENTS, PendingRequest::default()));
+        assert_async_execution(&mem, &mut engine, SEGMENTS[0].1);
+        check_dirty_mem(&mem, SEGMENTS[0].0, SEGMENTS[0].1);
+        check_clean_mem(&mem, GuestAddress(0), 4096);
+
+        // A segment outside guest memory fails the request before it is submitted.
+        let segments = [SEGMENTS[0], (GuestAddress(MEM_LEN as u64), 512)];
+        match engine.readv(0, &mem, &segments, PendingRequest::default()) {
+            Err(err) => assert!(matches!(
+                err.error,
+                BlockIoError::Async(AsyncIoError::GuestMemory(_))
+            )),
+            Ok(_) => panic!("read into memory outside the guest succeeded"),
+        }
     }
 }
