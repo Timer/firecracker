@@ -160,6 +160,39 @@ impl SyncFileEngine {
         Ok(count)
     }
 
+    /// Reads into the guest memory `segments` in order, from the file starting at `offset`.
+    ///
+    /// Each segment takes its own `read`, rather than one `preadv` for all of them, so that the
+    /// seccomp filters need no new system call.
+    pub fn readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+    ) -> Result<u32, SyncIoError> {
+        let mut count = 0;
+        for &(addr, len) in segments {
+            count += self.read(offset + u64::from(count), mem, addr, len)?;
+        }
+        Ok(count)
+    }
+
+    /// Writes the guest memory `segments` in order, to the file starting at `offset`.
+    ///
+    /// Each segment takes its own `write`, for the same reason as in [`Self::readv`].
+    pub fn writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+    ) -> Result<u32, SyncIoError> {
+        let mut count = 0;
+        for &(addr, len) in segments {
+            count += self.write(offset + u64::from(count), mem, addr, len)?;
+        }
+        Ok(count)
+    }
+
     pub fn flush(&mut self) -> Result<(), SyncIoError> {
         // flush() first to force any cached data out of rust buffers.
         self.file.flush().map_err(SyncIoError::Flush)?;
