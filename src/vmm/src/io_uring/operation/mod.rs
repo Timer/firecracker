@@ -27,6 +27,10 @@ pub enum OpCode {
     Read = io_uring_op::IORING_OP_READ as u8,
     /// Write operation.
     Write = io_uring_op::IORING_OP_WRITE as u8,
+    /// Vectored read operation.
+    Readv = io_uring_op::IORING_OP_READV as u8,
+    /// Vectored write operation.
+    Writev = io_uring_op::IORING_OP_WRITEV as u8,
     /// Fsync operation.
     Fsync = io_uring_op::IORING_OP_FSYNC as u8,
 }
@@ -37,6 +41,8 @@ impl From<OpCode> for &'static str {
         match opcode {
             OpCode::Read => "read",
             OpCode::Write => "write",
+            OpCode::Readv => "readv",
+            OpCode::Writev => "writev",
             OpCode::Fsync => "fsync",
         }
     }
@@ -92,6 +98,34 @@ impl<T: Debug> Operation<T> {
         Self {
             fd,
             opcode: OpCode::Write,
+            addr: Some(addr),
+            len: Some(len),
+            flags: 0,
+            offset: Some(offset),
+            user_data,
+        }
+    }
+
+    /// Construct a vectored read operation, into the buffers described by the `len` `iovec`s
+    /// at `addr`. The `iovec`s, like the buffers, must stay valid until the operation completes.
+    pub fn readv(fd: FixedFd, addr: usize, len: u32, offset: u64, user_data: T) -> Self {
+        Self {
+            fd,
+            opcode: OpCode::Readv,
+            addr: Some(addr),
+            len: Some(len),
+            flags: 0,
+            offset: Some(offset),
+            user_data,
+        }
+    }
+
+    /// Construct a vectored write operation, from the buffers described by the `len` `iovec`s
+    /// at `addr`. The `iovec`s, like the buffers, must stay valid until the operation completes.
+    pub fn writev(fd: FixedFd, addr: usize, len: u32, offset: u64, user_data: T) -> Self {
+        Self {
+            fd,
+            opcode: OpCode::Writev,
             addr: Some(addr),
             len: Some(len),
             flags: 0,

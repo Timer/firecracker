@@ -96,6 +96,15 @@ and this project adheres to
 
 ### Fixed
 
+- [#865](https://github.com/firecracker-microvm/firecracker/issues/865): Fixed
+  virtio-block requests whose data the guest splits over more than one
+  descriptor, which the virtio specification allows. The device took the second
+  data descriptor for the status one: it failed such requests without writing
+  their status or, for reads, filled only the first data buffer and wrote the
+  status byte into the second. This broke guests whose drivers split requests,
+  such as NetBSD 10.0 and earlier, the Nanos unikernel and macOS. Every IO
+  engine now accepts any number of data descriptors per request.
+
 - [#6302](https://github.com/firecracker-microvm/firecracker/issues/6302): Fixed
   AMX tile state being lost after a snapshot restore. The IA32_XFD and
   IA32_XFD_ERR MSRs are now saved in snapshots. Without them a restored guest

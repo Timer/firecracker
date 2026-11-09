@@ -26,7 +26,7 @@ use vmm_sys_util::syscall::SyscallReturnCode;
 use crate::io_uring::generated::io_uring_register_op;
 
 // IO_uring operations that we require to be supported by the host kernel.
-const REQUIRED_OPS: [OpCode; 2] = [OpCode::Read, OpCode::Write];
+const REQUIRED_OPS: [OpCode; 4] = [OpCode::Read, OpCode::Write, OpCode::Readv, OpCode::Writev];
 // Taken from linux/fs/io_uring.c
 const IORING_MAX_FIXED_FILES: usize = 1 << 15;
 
@@ -623,5 +623,52 @@ mod tests {
         free_mem_region(write_mem_region);
         free_mem_region(sync_read_mem_region);
         free_mem_region(async_read_mem_region);
+    }
+
+    #[test]
+    fn test_readv_writev() {
+        let file = TempFile::new().unwrap().into_file();
+        let mut ring = IoUring::new(4, vec![&file], vec![], None).unwrap();
+
+        // One writev of two buffers fills consecutive bytes of the file, from offset 1.
+        let first = [1u8; 3];
+        let second = [2u8; 5];
+        let iovecs = [
+            libc::iovec {
+                iov_base: first.as_ptr().cast_mut().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_ptr().cast_mut().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        ring.push(Operation::writev(0, iovecs.as_ptr() as usize, 2, 1, 8))
+            .unwrap();
+        ring.submit_and_wait_all().unwrap();
+        drain_cqueue(&mut ring);
+        let mut contents = [0u8; 9];
+        file.read_exact_at(&mut contents, 0).unwrap();
+        assert_eq!(contents, [0, 1, 1, 1, 2, 2, 2, 2, 2]);
+
+        // One readv of buffers of other sizes reads them back in order.
+        let mut first = [0u8; 6];
+        let mut second = [0u8; 2];
+        let iovecs = [
+            libc::iovec {
+                iov_base: first.as_mut_ptr().cast(),
+                iov_len: first.len(),
+            },
+            libc::iovec {
+                iov_base: second.as_mut_ptr().cast(),
+                iov_len: second.len(),
+            },
+        ];
+        ring.push(Operation::readv(0, iovecs.as_ptr() as usize, 2, 1, 8))
+            .unwrap();
+        ring.submit_and_wait_all().unwrap();
+        drain_cqueue(&mut ring);
+        assert_eq!(first, [1, 1, 1, 2, 2, 2]);
+        assert_eq!(second, [2, 2]);
     }
 }
