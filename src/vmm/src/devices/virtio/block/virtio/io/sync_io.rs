@@ -11,6 +11,7 @@ use vm_memory::{
     WriteVolatile,
 };
 
+use super::check_segments;
 use crate::vstate::memory::{Bitmap, GuestAddress, GuestMemoryMmap};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
@@ -79,6 +80,16 @@ pub(super) fn file_discard_range(file: &File, range: (u64, u32)) -> Result<u32, 
     }
 
     Ok(discarded)
+}
+
+/// The file offset of a segment that follows `count` bytes of a transfer starting at `offset`.
+fn segment_offset(offset: u64, count: u32) -> Result<u64, SyncIoError> {
+    offset.checked_add(u64::from(count)).ok_or_else(|| {
+        SyncIoError::Seek(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "file offset overflow",
+        ))
+    })
 }
 
 impl SyncFileEngine {
@@ -157,6 +168,45 @@ impl SyncFileEngine {
         mem.get_slice(addr, count as usize)
             .and_then(|slice| Ok(self.file.write_all_volatile(&slice)?))
             .map_err(SyncIoError::Transfer)?;
+        Ok(count)
+    }
+
+    /// Reads into the guest memory `segments` in order, from the file starting at `offset`.
+    ///
+    /// Each segment takes its own `read`, rather than one `preadv` for all of them, so that the
+    /// seccomp filters need no new system call. Nothing is read if one of the segments is not
+    /// guest memory.
+    pub fn readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+    ) -> Result<u32, SyncIoError> {
+        // The lengths add up to no more than `u32::MAX`, so `count` cannot overflow below.
+        check_segments(mem, segments).map_err(SyncIoError::Transfer)?;
+        let mut count = 0;
+        for &(addr, len) in segments {
+            count += self.read(segment_offset(offset, count)?, mem, addr, len)?;
+        }
+        Ok(count)
+    }
+
+    /// Writes the guest memory `segments` in order, to the file starting at `offset`.
+    ///
+    /// Each segment takes its own `write`, for the same reason as in [`Self::readv`]. Nothing is
+    /// written if one of the segments is not guest memory.
+    pub fn writev(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+    ) -> Result<u32, SyncIoError> {
+        // The lengths add up to no more than `u32::MAX`, so `count` cannot overflow below.
+        check_segments(mem, segments).map_err(SyncIoError::Transfer)?;
+        let mut count = 0;
+        for &(addr, len) in segments {
+            count += self.write(segment_offset(offset, count)?, mem, addr, len)?;
+        }
         Ok(count)
     }
 

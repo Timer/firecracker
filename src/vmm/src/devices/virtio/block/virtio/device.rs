@@ -1160,6 +1160,7 @@ mod tests {
     use std::fs::metadata;
     use std::io::{Read, Write};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileExt;
     use std::thread;
     use std::time::Duration;
 
@@ -1172,7 +1173,7 @@ mod tests {
     use crate::devices::virtio::block::virtio::test_utils::{
         RequestDescriptorChain, default_block, default_mq_block, default_threaded_block,
         read_blk_req_descriptors, set_queue, set_rate_limiter, simulate_async_completion_event,
-        simulate_queue_and_async_completion_events, simulate_queue_event,
+        simulate_queue_and_async_completion_events, simulate_queue_event, split_blk_req_data,
     };
     use crate::devices::virtio::block::virtio::{DEFAULT_BLOCK_NUM_QUEUES, IO_URING_NUM_ENTRIES};
     use crate::devices::virtio::queue::{VIRTQ_DESC_F_NEXT, VIRTQ_DESC_F_WRITE};
@@ -2248,6 +2249,177 @@ mod tests {
                 assert_eq!(vq.used.idx.get(), 1);
                 assert_eq!(vq.used.ring[0].get().id, 0);
                 assert_eq!(vq.used.ring[0].get().len, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_multi_descriptor_requests() {
+        for engine in [FileEngineType::Sync, FileEngineType::Async] {
+            let mut block = default_block(engine);
+            let mem = default_mem();
+            let interrupt = default_interrupt();
+            let vq = VirtQueue::new(GuestAddress(0), &mem, 16);
+            set_queue(&mut block, 0, vq.create_queue());
+            block.activate(mem.clone(), interrupt).unwrap();
+            read_blk_req_descriptors(&vq);
+
+            let request_type_addr = GuestAddress(vq.dtable[0].addr.get());
+            let status_addr = GuestAddress(vq.dtable[2].addr.get());
+            let data = vmm_sys_util::rand::rand_alphanumerics(0x800)
+                .as_bytes()
+                .to_vec();
+            // Put right after each data buffer, which must not be written past.
+            let guard = [0xa5u8; 0x10];
+
+            // Write 4 sectors from buffers that split them unevenly.
+            {
+                let segments = [(0x2000, 0x300), (0x4000, 0x100), (0x5000, 0x400)];
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_OUT, 1), request_type_addr)
+                    .unwrap();
+                vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+                split_blk_req_data(&vq, &segments);
+                let mut chunks = data.as_slice();
+                for (addr, len) in segments {
+                    let (chunk, rest) = chunks.split_at(len as usize);
+                    mem.write_slice(chunk, GuestAddress(addr)).unwrap();
+                    chunks = rest;
+                }
+
+                simulate_queue_and_async_completion_events(&mut block, true);
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().id, 0);
+                assert_eq!(vq.used.ring[0].get().len, 1);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+                let mut buf = vec![0u8; data.len()];
+                block
+                    .disk()
+                    .file_engine
+                    .file()
+                    .read_exact_at(&mut buf, 512)
+                    .unwrap();
+                assert_eq!(buf, data);
+            }
+
+            // Read them back into buffers that split them differently.
+            {
+                vq.used.idx.set(0);
+                set_queue(&mut block, 0, vq.create_queue());
+                let segments = [(0x6000, 0x100), (0x7000, 0x500), (0x8000, 0x200)];
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 1), request_type_addr)
+                    .unwrap();
+                vq.dtable[1]
+                    .flags
+                    .set(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+                split_blk_req_data(&vq, &segments);
+                for (addr, len) in segments {
+                    mem.write_slice(&guard, GuestAddress(addr + u64::from(len)))
+                        .unwrap();
+                }
+
+                simulate_queue_and_async_completion_events(&mut block, true);
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().id, 0);
+                assert_eq!(vq.used.ring[0].get().len, 0x801);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+                let mut chunks = data.as_slice();
+                for (addr, len) in segments {
+                    let (chunk, rest) = chunks.split_at(len as usize);
+                    let mut buf = vec![0u8; chunk.len()];
+                    mem.read_slice(&mut buf, GuestAddress(addr)).unwrap();
+                    assert_eq!(buf, chunk);
+                    let mut buf = [0u8; 0x10];
+                    mem.read_slice(&mut buf, GuestAddress(addr + u64::from(len)))
+                        .unwrap();
+                    assert_eq!(buf, guard);
+                    chunks = rest;
+                }
+            }
+
+            // The device ID can be split as well.
+            {
+                vq.used.idx.set(0);
+                set_queue(&mut block, 0, vq.create_queue());
+                let segments = [(0x2000, 7), (0x4000, VIRTIO_BLK_ID_BYTES - 7)];
+                mem.write_obj(
+                    RequestHeader::new(VIRTIO_BLK_T_GET_ID, 0),
+                    request_type_addr,
+                )
+                .unwrap();
+                split_blk_req_data(&vq, &segments);
+
+                simulate_queue_event(&mut block, Some(true));
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().id, 0);
+                assert_eq!(vq.used.ring[0].get().len, VIRTIO_BLK_ID_BYTES + 1);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+                let mut id = [0u8; VIRTIO_BLK_ID_BYTES as usize];
+                mem.read_slice(&mut id[..7], GuestAddress(0x2000)).unwrap();
+                mem.read_slice(&mut id[7..], GuestAddress(0x4000)).unwrap();
+                assert_eq!(id, block.disk().image_id);
+            }
+
+            // A write with a data descriptor that is not guest memory fails as a whole: the
+            // guest gets an error status, and no part of the data reaches the disk.
+            {
+                vq.used.idx.set(0);
+                set_queue(&mut block, 0, vq.create_queue());
+                // The second one starts where the guest memory of `default_mem` ends.
+                let segments = [(0x2000, 0x300), (0x10000, 0x100), (0x5000, 0x400)];
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_OUT, 1), request_type_addr)
+                    .unwrap();
+                vq.dtable[1].flags.set(VIRTQ_DESC_F_NEXT);
+                split_blk_req_data(&vq, &segments);
+                mem.write_slice(&[0x5a; 0x300], GuestAddress(0x2000))
+                    .unwrap();
+                mem.write_slice(&[0x5a; 0x400], GuestAddress(0x5000))
+                    .unwrap();
+
+                simulate_queue_event(&mut block, Some(true));
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().id, 0);
+                assert_eq!(vq.used.ring[0].get().len, 1);
+                assert_eq!(
+                    mem.read_obj::<u32>(status_addr).unwrap(),
+                    VIRTIO_BLK_S_IOERR
+                );
+
+                let mut buf = vec![0u8; data.len()];
+                block
+                    .disk()
+                    .file_engine
+                    .file()
+                    .read_exact_at(&mut buf, 512)
+                    .unwrap();
+                assert_eq!(buf, data);
+            }
+
+            // Empty data descriptors are skipped, wherever they point.
+            {
+                vq.used.idx.set(0);
+                set_queue(&mut block, 0, vq.create_queue());
+                let segments = [(0x10000, 0), (0x6000, 0x400), (0x10000, 0), (0x7000, 0x400)];
+                mem.write_obj(RequestHeader::new(VIRTIO_BLK_T_IN, 1), request_type_addr)
+                    .unwrap();
+                vq.dtable[1]
+                    .flags
+                    .set(VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE);
+                split_blk_req_data(&vq, &segments);
+
+                simulate_queue_and_async_completion_events(&mut block, true);
+                assert_eq!(vq.used.idx.get(), 1);
+                assert_eq!(vq.used.ring[0].get().len, 0x801);
+                assert_eq!(mem.read_obj::<u32>(status_addr).unwrap(), VIRTIO_BLK_S_OK);
+
+                let mut buf = vec![0u8; data.len()];
+                mem.read_slice(&mut buf[..0x400], GuestAddress(0x6000))
+                    .unwrap();
+                mem.read_slice(&mut buf[0x400..], GuestAddress(0x7000))
+                    .unwrap();
+                assert_eq!(buf, data);
             }
         }
     }

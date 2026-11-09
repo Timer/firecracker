@@ -17,6 +17,7 @@ use imago::vmdk::Vmdk;
 use imago::{Storage, StorageOpenOptions};
 use vm_memory::{GuestMemoryBackend, GuestMemoryError};
 
+use crate::devices::virtio::block::virtio::io::check_segments;
 use crate::vstate::memory::{GuestAddress, GuestMemoryMmap};
 
 /// Errors specific to the VMDK IO engine.
@@ -218,6 +219,30 @@ impl VmdkFileEngine {
                 .copy_from(&self.read_buffer[..len]);
         }
 
+        Ok(count)
+    }
+
+    /// Reads into the guest memory `segments` in order, from the image starting at `offset`.
+    ///
+    /// Nothing is read if one of the segments is not guest memory.
+    pub fn readv(
+        &mut self,
+        offset: u64,
+        mem: &GuestMemoryMmap,
+        segments: &[(GuestAddress, u32)],
+    ) -> Result<u32, VmdkIoError> {
+        // The lengths add up to no more than `u32::MAX`, so `count` cannot overflow below.
+        check_segments(mem, segments).map_err(VmdkIoError::GuestMemory)?;
+        let mut count = 0;
+        for &(addr, len) in segments {
+            let segment_offset = offset.checked_add(u64::from(count)).ok_or_else(|| {
+                VmdkIoError::Read(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "VMDK read offset overflow",
+                ))
+            })?;
+            count += self.read(segment_offset, mem, addr, len)?;
+        }
         Ok(count)
     }
 

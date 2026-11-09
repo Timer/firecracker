@@ -233,3 +233,22 @@ pub fn read_blk_req_descriptors(vq: &VirtQueue) {
     // Mark the next available descriptor.
     vq.avail.idx.set(1);
 }
+
+/// Splits the data of the chain put by [`read_blk_req_descriptors`] over one descriptor per
+/// `(address, length)` pair in `segments`, in order.
+///
+/// The first segment reuses the data descriptor, and the others take the descriptor table entries
+/// from index 3 on. They all get the flags of the data descriptor.
+pub fn split_blk_req_data(vq: &VirtQueue, segments: &[(u64, u32)]) {
+    let flags = vq.dtable[1].flags.get();
+    let mut desc = 1;
+    for (i, &(addr, len)) in segments.iter().enumerate() {
+        let next = if i + 1 < segments.len() {
+            u16::try_from(i + 3).unwrap()
+        } else {
+            2
+        };
+        vq.dtable[usize::from(desc)].set(addr, len, flags, next);
+        desc = next;
+    }
+}
